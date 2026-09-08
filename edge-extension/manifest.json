@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "深大研究生选课 · 自动抢课助手",
+  "version": "1.0.0",
+  "description": "在研究生选课页面自动轮询所有分页，发现余量立刻点选课。",
+  "content_scripts": [
+    {
+      "matches": ["https://ehall.szu.edu.cn/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}
