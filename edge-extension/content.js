@@ -156,8 +156,21 @@ function cls(el) {
   var c = el && el.className;
   return typeof c === 'string' ? c : (c && c.baseVal) || '';
 }
+/* 助手面板也是页面上的 DOM，所有“扫描页面”的逻辑都必须把它排掉。
+ * 不排会出大事：面板里“密码”和“Key”是两个 type=password 输入框，
+ * 展开“自动登录”那一栏之后它们是可见的，于是
+ *   sessionLost()   —— 判据是“页面上有可见密码框”，直接永远为真，一开始抢课就喊掉线；
+ *   findLoginForm() —— 把面板当成登录表单，拿“包含”框当用户名框、把学号写进去，
+ *                      又找不到登录按钮，于是一直报“没找到登录按钮”；
+ *                      登录真的成功了也判不出来，因为面板还在，表单就“还没消失”。
+ * 收起那一栏就正常，所以症状看着像“之前保存过密码就没事”——那只是没展开而已。 */
+function inPanel(el) {
+  try { return !!(el && el.closest && el.closest('#szg-panel')); } catch (e) { return false; }
+}
+
 function visible(el) {
   if (!el || !el.getBoundingClientRect) return false;
+  if (inPanel(el)) return false;
   var r = el.getBoundingClientRect();
   if (r.width <= 0 || r.height <= 0) return false;
   var win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
@@ -1202,6 +1215,18 @@ async function ocrCaptcha(dataUrl) {
 }
 
 var VARIANTS = ['up', 'sharp', 'raw'];
+var VNAME = { up: '放大', sharp: '放大+对比', raw: '原尺寸' };
+
+/* 出现次数最多的那个，以及它拿到几票 */
+function topPick(list) {
+  var best = list[0] || '', n = 0;
+  list.forEach(function (p) {
+    var c = 0;
+    list.forEach(function (q) { if (q === p) c++; });
+    if (c > n) { n = c; best = p; }
+  });
+  return { code: best, n: n };
+}
 
 /* 读一张验证码。两条便宜的容错，都在“提交”之前完成——图没提交就没作废，问几次都不额外消耗：
  *
@@ -1215,27 +1240,29 @@ var VARIANTS = ['up', 'sharp', 'raw'];
 async function readCaptcha(img) {
   var picks = [], notes = [];
   var want = Math.max(1, Math.min(VARIANTS.length, cfg.ocrVote || 1));
-  for (var i = 0; i < want; i++) {
+  for (var i = 0; i < VARIANTS.length; i++) {
+    if (i >= want) {
+      /* 配额用完了。只有一种情况值得再多问一次：几种结果各说各的、凑不出多数票。
+       * 那时候二选一等于抛硬币，而猜错要赔上一整轮“提交→被打回→换图→重认”，
+       * 多花一次调用买一张决胜票是划算的。 */
+      if (picks.length < 2 || topPick(picks).n > 1) break;
+      log('前 ' + i + ' 种处理结果不一致，再用“' + VNAME[VARIANTS[i]] + '”打破平局', 'warn');
+    }
     var r = await ocrCaptcha(await captchaDataUrl(img, VARIANTS[i]));
     if (!CODE_RE.test(r.code)) {
-      notes.push(VARIANTS[i] + '=' + (r.code || r.raw || '空') + '(位数不对)');
+      notes.push(VNAME[VARIANTS[i]] + '=' + (r.code || r.raw || '空') + '(位数不对)');
       continue;
     }
     picks.push(r.code);
-    notes.push(VARIANTS[i] + '=' + r.code);
-    if (picks.length >= 2 && picks[picks.length - 1] === picks[picks.length - 2]) break;
+    notes.push(VNAME[VARIANTS[i]] + '=' + r.code);
+    if (topPick(picks).n >= 2) break;          // 已经有两票一致，不必再问
   }
   if (!picks.length) throw new Error('几种处理都没读出 4 位验证码（' + notes.join('，') + '）');
-  var best = picks[0], bestN = 0;
-  picks.forEach(function (p) {
-    var c = 0;
-    picks.forEach(function (q) { if (q === p) c++; });
-    if (c > bestN) { bestN = c; best = p; }
-  });
-  if (picks.length > 1 && bestN === 1) {
-    log('几种处理结果不一致（' + notes.join('，') + '），先按“' + best + '”提交试试', 'warn');
+  var top = topPick(picks);
+  if (picks.length > 1 && top.n === 1) {
+    log('几种处理都不一致（' + notes.join('，') + '），先按“' + top.code + '”提交试试', 'warn');
   }
-  return best;
+  return top.code;
 }
 
 /* 找登录表单。先按深大这个页面上的固定 id 找，找不到再按类型/关键词兜底，
@@ -1381,6 +1408,7 @@ function loginMsgs(f) {
 var LOGIN_ERR = /错误|不正确|有误|失败|无效|不存在|锁定|冻结|停用|禁用|次数|请重新|不匹配|不一致/;
 
 var loginTries = 0;        // 本次掉线里已经试了几轮
+var autoLoginOff = false;  // 本次运行内暂停自动登录。只影响运行时，不动配置，面板复选框保持原样
 var loginBusy = false;
 var loginBlocked = '';     // 非空 = 账号密码本身有问题，停手别再自动试
 
@@ -1394,7 +1422,7 @@ function judgeLoginMsg(msg) {
 
 /* 返回 'ok' 成功 / 'retry' 再来一次 / 'stop' 别再试了 / 'idle' 当前没有登录框 */
 async function autoLogin() {
-  if (loginBusy || loginBlocked || !cfg.autoLogin) return 'idle';
+  if (loginBusy || loginBlocked || autoLoginOff || !cfg.autoLogin) return 'idle';
   if (!auth.user || !auth.pass) {
     loginBlocked = '面板里还没填学号或密码';
     log('自动登录用不了：' + loginBlocked, 'err');
@@ -1428,10 +1456,16 @@ async function autoLogin() {
     realClick(f.btn);
 
     // 等结果：要么登录框没了（成了），要么弹一句提示
+    /* 点完之后等结果。成功的信号不止“登录框没了”一种：
+     * 这个门户登录后地址不变、页面结构也接近，所以再认两个硬信号——
+     * 出现了“我的选课”入口，或者干脆已经站在选课页上。
+     * 只认单一信号的话，页面稍微慢一点或者登录框留在 DOM 里没删，就会误判成失败，
+     * 白白换掉一张已经正确的验证码。 */
     var t1 = Date.now();
     while (Date.now() - t1 < 9000) {
       await sleep(randRange(200, 350));
       if (!findLoginForm()) return 'ok';
+      if (findCourseEntry() || onCoursePage()) return 'ok';
       var hit = loginMsgs(f).filter(function (t) {
         return !before.has(t) && LOGIN_ERR.test(t);
       })[0];
@@ -1494,16 +1528,15 @@ async function testOcr() {
   /* 三种处理各报一次，你对着图看哪种准。
    * 如果“原尺寸”明显比放大的准，就把“交叉验证”调成 1 再说；
    * 如果三种都认不出来，多半是这个模型吃不下你们的验证码，换个模型。 */
-  var names = { up: '放大', sharp: '放大+对比', raw: '原尺寸' };
   for (var i = 0; i < VARIANTS.length; i++) {
     try {
       var t0 = Date.now();
       var r = await ocrCaptcha(await captchaDataUrl(f.img, VARIANTS[i]));
-      log('  ' + names[VARIANTS[i]] + ' → “' + (r.code || r.raw || '空') + '”' +
+      log('  ' + VNAME[VARIANTS[i]] + ' → “' + (r.code || r.raw || '空') + '”' +
           (CODE_RE.test(r.code) ? '' : '（不是 4 位）') + '（' + (Date.now() - t0) + 'ms）',
           CODE_RE.test(r.code) ? 'ok' : 'warn');
     } catch (e) {
-      log('  ' + names[VARIANTS[i]] + ' → 失败：' + (e && e.message ? e.message : e), 'err');
+      log('  ' + VNAME[VARIANTS[i]] + ' → 失败：' + (e && e.message ? e.message : e), 'err');
       break;                              // Key/模型不对的话，后面两种也一样会失败
     }
   }
@@ -1818,11 +1851,11 @@ function watchLogin() {
         backToCourse();
         break;
       }
-      if (cfg.autoLogin && !loginBlocked) {
+      if (cfg.autoLogin && !loginBlocked && !autoLoginOff) {
         if (loginTries >= cfg.ocrMaxTry) {
           log('自动登录试了 ' + loginTries + ' 次都没成，改成等你手动登录', 'err');
           startAlarm('自动登录失败，请手动登录');
-          cfg.autoLogin = false;                 // 只对本次掉线失效，配置不落盘
+          autoLoginOff = true;                   // 只暂停本次，配置和复选框都不动
           captchaFocused = focusCaptcha();
         } else {
           loginTries++;
@@ -1884,6 +1917,7 @@ function start() {
     return;
   }
   running = true;
+  autoLoginOff = false;      // 手动点“开始抢课”＝重新给自动登录一次机会
   stats.round = 0;
   setState(true);
   log('开始运行 · 模式=' + (cfg.mode === 'all' ? '所有有余量的课' : '关键词[' + cfg.include + ']') +
