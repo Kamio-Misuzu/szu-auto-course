@@ -11,16 +11,19 @@ fs.mkdirSync(path.join(root, 'edge-extension'), { recursive: true });
 fs.writeFileSync(path.join(root, 'edge-extension', 'content.js'), src, 'utf8');
 
 // 2) 离线仿真页：把脚本内联进去，双击就能跑
-const demoPath = path.join(root, 'test', 'demo.html');
-if (fs.existsSync(demoPath)) {
-  let html = fs.readFileSync(demoPath, 'utf8');
+//    demo.html       = 选课列表，测抢课主流程
+//    login-demo.html = 登录页，测掉线自动重登 + 验证码识别（那边的大模型接口是假的）
+const demos = ['demo.html', 'login-demo.html'];
+const synced = ['edge-extension/content.js'];
+demos.forEach(function (name) {
+  const p = path.join(root, 'test', name);
+  if (!fs.existsSync(p)) return;
+  let html = fs.readFileSync(p, 'utf8');
   const start = html.indexOf('<!--SCRIPT-->');
-  if (start >= 0) {
-    html = html.slice(0, start) + '<!--SCRIPT-->\n<script>\n' + src + '\n</scr' + 'ipt>\n</body>\n</html>\n';
-    fs.writeFileSync(demoPath, html, 'utf8');
-  } else {
-    console.warn('demo.html 里没有 <!--SCRIPT--> 标记，跳过');
-  }
-}
+  if (start < 0) { console.warn(name + ' 里没有 <!--SCRIPT--> 标记，跳过'); return; }
+  html = html.slice(0, start) + '<!--SCRIPT-->\n<script>\n' + src + '\n</scr' + 'ipt>\n</body>\n</html>\n';
+  fs.writeFileSync(p, html, 'utf8');
+  synced.push('test/' + name);
+});
 
-console.log('已同步：edge-extension/content.js' + (fs.existsSync(demoPath) ? '、test/demo.html' : ''));
+console.log('已同步：' + synced.join('、'));
